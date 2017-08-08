@@ -1,0 +1,226 @@
+---
+title: "Onassis: Ontology Annotation and Semantic Similarity software"
+author: "Eugenia Galeota"
+date: "`r Sys.Date()`"
+output: BiocStyle::html_document
+---
+
+```{r loading_libs}
+library(Onassis)
+library(GEOmetadb)
+library(tools)
+```
+
+
+
+```{r loading_cistrome_metadata}
+setwd("/Users/egaleota/Library/Mobile Documents/com~apple~CloudDocs/IITDrive/OneDriveFondazioneIstitutoItalianoTecnologia/ChromStates")
+cistrome_data= read.table('histone_human_data_information.txt', sep='\t', header=F, stringsAsFactor=F)
+
+gsm_ids <- unique(cistrome_data$V2)
+
+geo_con <- connectToGEODB(download=TRUE, destdir='./data')
+
+gsm_metadata <- dbGetQuery(geo_con, paste0("select * from gsm where gsm in ('", paste(gsm_ids, collapse="','"), "')"))
+
+```
+
+To annotate cistrome data with terms from cell line ontology we downloaded the cell line ontology in OWL format from https://raw.githubusercontent.com/CLO-ontology/CLO/master/src/ontology/clo_merged.owl
+
+With the owl ontology available we can create a dictionary for conceptmapper
+
+```{r dictionary_of_cells }
+
+cell_dict <- dictionary(inputFileOrDb = file.path(getwd(), 'data', 'cl.obo'), dictType = 'OBO',outputdir = file.path(getwd(), 'data'), synonymType = 'ALL' )
+
+cell_dict <- dictionary(inputFileOrDb = file.path(getwd(), 'data', 'cmDict-clo_merged.xml'), dictType = 'CMDICT')
+
+
+efo_dict <- dictionary(inputFileOrDb = './data/efo.obo', dictType = 'OBO', outputdir = './data/', synonymType = 'ALL')
+
+```
+
+The code produced a dictionary cmDict-clo_merged.xml in the data directory.
+Now we have to annotate the data frame containing the metadata of the samples available in cistrome 
+
+```{r cell_line_annotation}
+
+opt <- CMoptions()
+paramValueIndex(opt) <- 31
+
+#Adding cell to the source name to find also cell names
+gsm_metadata$source_name_ch1[!grepl('cell', tolower(gsm_metadata$source_name_ch1))] <- paste0(gsm_metadata$source_name_ch1[!grepl('cell', tolower(gsm_metadata$source_name_ch1))], ' cell')
+
+gsm_metadata$characteristics_ch1 <- gsub('\\t' , ' ', gsm_metadata$characteristics_ch1 )
+gsm_metadata$characteristics_ch1 <- gsub(';' , ' ', gsm_metadata$characteristics_ch1 )
+
+#Annotation of cell lines
+cell_line_annotations <- annotate(inputFileorDf = gsm_metadata[, c('gsm', 'source_name_ch1', 'characteristics_ch1'),  ], options = opt, dictionary = cell_dict, outDir = file.path(getwd(), 'data', 'tissue'))
+
+cell_line_filtered=cell_line_annotations 
+cell_line_filtered <- cell_line_filtered[grep("UBERON|CL", cell_line_filtered$term_id),]
+cell_line_filtered <- cell_line_filtered[which(!cell_line_filtered$term_name %in% c('cell', 'tissue', 'Homo sapiens', 'molecule', 'female organism', 'male organism', 'protein', 'cell line cell',  'chromatin', 'signaling', 'cultured cell', 'multicellular organism', 'compound organ', 'organ', 'anatomical conduit')),]
+ cell_line_filtered <- cell_line_filtered[!duplicated(cbind(cell_line_filtered$sample_id, cell_line_filtered$term_id)),]
+
+
+efo_annotations <- annotate(inputFileorDf = gsm_metadata[, c('gsm', 'source_name_ch1', 'characteristics_ch1') ], options = opt, dictionary = efo_dict, outDir = './data/')
+
+
+
+#Annotation of diseases 
+disease_dict <- dictionary(inputFileOrDb = file.path(getwd(), 'data' , 'doid-non-classified.obo'), dictType = 'OBO',outputdir = file.path(getwd(), 'data'), synonymType = 'ALL' )
+
+
+
+
+disease_annotations <- annotate(inputFileorDf = gsm_metadata[, c('gsm', 'source_name_ch1', 'characteristics_ch1') ], options = opt, dictionary = disease_dict, outDir = file.path(getwd(), 'data'))
+
+healthy_samples <- gsm_metadata$gsm[grep('disease: none|disease: normal|disease: presumed normal|disease: no ad present|disease: no ad evident', tolower(gsm_metadata$characteristics_ch1))]
+
+gsm_metadata2 <- gsm_metadata[which(!gsm_metadata$gsm %in% healthy_samples),]
+disease_annotations$term_url[which(disease_annotations$sample_id %in% healthy_samples)] <- 'Healthy'
+disease_annotations$term_id[which(disease_annotations$sample_id %in% healthy_samples)] <- 'Healthy'
+disease_annotations$term_name[which(disease_annotations$sample_id %in% healthy_samples)] <- 'Healthy'
+
+disease_annotations$matched_sentence[which(disease_annotations$sample_id %in% healthy_samples)] <- ""
+
+disease_annotations <- unique(disease_annotations)
+
+disease_annotations <- disease_annotations[which(!disease_annotations$term_name=='disease'),]
+ disease_annotations <- disease_annotations[!duplicated(cbind(disease_annotations$sample_id, disease_annotations$term_id)),]
+
+
+
+cell_dt <- setDT(cell_line_filtered)
+cell_collapsed <- cell_dt[, lapply(.SD, function(x) toString(unique(x[order(x)]))), by= sample_id]
+disease_dt <- setDT(disease_annotations)
+disease_collapsed <- disease_dt[, lapply(.SD, function(x) toString(unique(x[order(x)]))), by= sample_id]
+
+saveRDS(cell_collapsed, file='./data/cell_line_collapsed.rds')
+
+saveRDS(disease_collapsed, file='./data/disease_collapsed.rds')
+
+
+
+colnames(cell_collapsed)[2] <-"cell_term_id"
+colnames(cell_collapsed)[3] <-"cell_term_name"
+colnames(cell_collapsed)[4] <- "cell_term_url"
+colnames(cell_collapsed)[5] <- "cell_matched_sentence"
+
+
+total_annotations <- merge(cell_collapsed, disease_collapsed, by='sample_id', all.x=TRUE, all.y=TRUE)
+
+total_annotations_collapsed <- total_annotations[, lapply(.SD, function(x) toString(unique(x[order(x)]))), by= sample_id]
+
+```
+
+```{r similarity}
+
+annotated_samples <- as.character(as.vector(unique(cell_collapsed$cell_term_url)))
+n <- length(annotated_samples)
+names <- paste0('sample_', seq(1, n, by=1))
+ 
+annotated_df <- as.data.frame(cbind(names, annotated_samples))
+
+ontologyfile <- './data/cl.obo'
+samples_results <- data.frame(sample1 = character(0), sample2= character(0), value = double(0L))
+samples_results <- matrix(0, nrow=n, ncol=n)
+rownames(samples_results) <- colnames(samples_results) <- annotated_samples
+
+n <- length(unique(annotated_df[,2]))
+
+for(i in 1:(n-1)){
+  print(paste0('VALORE DI I: ', i))
+  sample1 <- as.character(annotated_df[i, 2])
+  sample1 <- strsplit(sample1, ', ')[[1]]
+  j = i + 1 
+  for(k in j:n){
+    sample2 <- as.character(annotated_df[k, 2])
+    sample2 <- strsplit(sample2, ', ')[[1]]
+    two_samples_similarity <- similarity(ontologyfile, sample1, sample2)
+    samples_results[i, k] <- samples_results[k, i] <- two_samples_similarity
+  }
+}
+diag(samples_results) <- 1
+
+sample_name_results <- samples_results
+colnames(sample_name_results) <- rownames(sample_name_results) <- cell_collapsed[match(rownames(samples_results), cell_collapsed$cell_term_url)]$cell_term_name
+
+sample_name_results <- 1 - sample_name_results
+similarity_dist <- as.dist(sample_name_results)
+saveRDS(samples_results, file='./data/similarity.rds')
+pdf('./data/semantic_distance.pdf',width=80, height=40)
+op <- par(mar = c(12,12,12,12) + 0.1)
+plot(hclust(d=similarity_dist), main='Semantic similarity distance based clustering of semantic classes associated to Cistrome data', hang=-1, col.axis='#F38630', col.lab="#7c8071", lwd=3, sub='')
+dev.off()
+
+
+semantic_distance <- as.dist(sample_name_results)
+clusters <- hclust(d=semantic_distance)
+merged_clusters <- cutree(clusters, h=quantile(clusters$height, 0.3))
+merged_clusters <- as.data.frame(cbind(names(merged_clusters), merged_clusters))
+colnames(merged_clusters) <- c('annotation', 'cluster')
+merged_clusters_names <- aggregate( annotation ~ cluster , data=merged_clusters, paste, collapse=', ')
+trim <- function (x) gsub("^\\s+|\\s+$", "", x)
+nuovi_ids <- apply(merged_clusters_names, 1, function(row) {
+  values <- gsub(" ", "", row[2])
+  values <- strsplit(values, ',')[[1]]
+  values <- unique(values)
+  paste(values, collapse=',')
+})
+merged_clusters_names <- cbind(merged_clusters_names, nuovi_ids)
+merged_clusters_names <- unique(merged_clusters_names[, c('cluster', 'nuovi_ids')])
+merged_clusters <- merge(merged_clusters, merged_clusters_names, by='cluster', all.x=TRUE)
+
+
+
+
+
+heatmap.2(samples_results, density.info = "none", trace="none", main='Semantic similarity of annotated samples', margins=c(5,5))
+
+
+
+topMarks= names(sort(table(data[,7]), decreasing=TRUE)[1:6])
+condNumb= function(targetMarks= topMarks, conds, marks=data[,7]) {
+	condsT= sort(table(conds), decreasing=T)
+	marksN= rep(0, length(condsT))
+	names(marksN)= names(condsT)
+	targetMarksN= length(targetMarks)
+	for(i in 1:length(condsT)) {
+		cond= names(condsT)[i]
+		if(cond=='None' || cond=='None # None') next
+		if(condsT[i]<targetMarksN) break
+		inds= which(conds==cond)
+		marksN[i]= length(which(targetMarks %in% marks[inds]))
+	}
+	condsSel= names(marksN)[which(marksN>=targetMarksN)]
+	return(condsSel)
+}
+
+pdf('chromStates_conds.pdf', 16,11)
+	layout(matrix(1:6,3,2))
+	par(mar=c(13,5,3,1))
+	cols= c(rep('grey95',4), 'grey80','grey60', rep('grey30', 14))
+	sData= sort(table(data[,7]), decreasing=T)
+	mp= barplot(sData[1:20], las=3, ylab='#samples', col=cols)
+	text(x=mp[4:6], y=sData[4:6]+60, labels=c('top4','top5','top6'))
+	for(i in 4:6) {
+		conds= data[,i]
+		condN6= condNumb(targetMarks= topMarks, conds= conds, marks=data[,7])
+		condN5= condNumb(targetMarks= topMarks[1:5], conds= conds, marks=data[,7])
+		condN4= condNumb(targetMarks= topMarks[1:4], conds= conds, marks=data[,7])
+		condN= paste0('tot=', length(unique(conds)), ' top6=', length(condN6), 
+			' top5=', length(condN5), ' top4=', length(condN4))
+		barplot(sort(table(conds[conds %in% condN6]), decreasing=T), las=3, main= condN, ylab='#samples')
+	}
+	
+	conds= paste0(data[,5], ' # ',data[,6])
+	condN6= condNumb(targetMarks= topMarks, conds= conds, marks=data[,7])
+	condN5= condNumb(targetMarks= topMarks[1:5], conds= conds, marks=data[,7])
+	condN4= condNumb(targetMarks= topMarks[1:4], conds= conds, marks=data[,7])
+	condN= paste0('tot=', length(unique(conds)), ' top6=', length(condN6), 
+		' top5=', length(condN5), ' top4=', length(condN4))
+	barplot(sort(table(conds[conds %in% condN6]), decreasing=T), las=3, main= condN, ylab='#samples')
+
+dev.off()
+```
